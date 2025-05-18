@@ -1,0 +1,202 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.widgets import Slider, Button
+from scipy.sparse import lil_matrix
+import dill
+import os
+import shutil
+from casim.casim import CancerSimulatorParameters, CancerSimulator
+
+# 3D matrix size (reduced for performance)
+MATRIX_SIZE_X = 50
+MATRIX_SIZE_Y = 50
+MATRIX_SIZE_Z = 50
+
+def initialize_3d_oxygen():
+    return np.full((MATRIX_SIZE_X, MATRIX_SIZE_Y, MATRIX_SIZE_Z), 40.0)
+
+def simulate_oxygen_3d(cell_matrix_3d, diff_rate=2e-5, consumption_rate=0.3):
+    """Simulate oxygen diffusion and consumption in 3D"""
+    oxygen_grid = initialize_3d_oxygen()
+    for _ in range(5):
+        new_oxy = oxygen_grid.copy()
+        for x in range(1, MATRIX_SIZE_X-1):
+            for y in range(1, MATRIX_SIZE_Y-1):
+                for z in range(1, MATRIX_SIZE_Z-1):
+                    laplacian = (oxygen_grid[x-1,y,z] + oxygen_grid[x+1,y,z] +
+                                oxygen_grid[x,y-1,z] + oxygen_grid[x,y+1,z] +
+                                oxygen_grid[x,y,z-1] + oxygen_grid[x,y,z+1] -
+                                6*oxygen_grid[x,y,z])
+                    consumption = consumption_rate if cell_matrix_3d[x,y,z] else 0
+                    new_oxy[x,y,z] = oxygen_grid[x,y,z] + (diff_rate * laplacian) - consumption
+        oxygen_grid = np.clip(new_oxy, 0, 40)
+    return oxygen_grid
+
+def generate_initial_tumor_3d(center_x=25, center_y=25, center_z=25, radius=3):
+    tumor = np.zeros((MATRIX_SIZE_X, MATRIX_SIZE_Y, MATRIX_SIZE_Z), dtype=bool)
+    for x in range(MATRIX_SIZE_X):
+        for y in range(MATRIX_SIZE_Y):
+            for z in range(MATRIX_SIZE_Z):
+                if ((x-center_x)**2 + (y-center_y)**2 + (z-center_z)**2) <= radius**2:
+                    tumor[x,y,z] = True
+    return tumor
+
+def simulate_growth_3d(tumor_cells, oxygen_grid, division_prob=0.7, death_prob=0.05, hypoxia_threshold=5):
+    new_tumor = tumor_cells.copy()
+    x_indices, y_indices, z_indices = np.where(tumor_cells)
+    for i in range(len(x_indices)):
+        x, y, z = x_indices[i], y_indices[i], z_indices[i]
+        o2_level = oxygen_grid[x,y,z]
+        death_probability = death_prob
+        if o2_level < hypoxia_threshold:
+            death_probability = 0.2
+        if np.random.random() < death_probability:
+            new_tumor[x,y,z] = False
+            continue
+        division_probability = division_prob * (o2_level / 40.0)
+        if np.random.random() < division_probability:
+            neighbors = []
+            for dx, dy, dz in [(1,0,0), (-1,0,0), (0,1,0), (0,-1,0), (0,0,1), (0,0,-1)]:
+                nx, ny, nz = x+dx, y+dy, z+dz
+                if 0 <= nx < MATRIX_SIZE_X and 0 <= ny < MATRIX_SIZE_Y and 0 <= nz < MATRIX_SIZE_Z:
+                    if not tumor_cells[nx,ny,nz]:
+                        neighbors.append((nx,ny,nz))
+            if neighbors:
+                nx, ny, nz = neighbors[np.random.randint(len(neighbors))]
+                new_tumor[nx,ny,nz] = True
+    return new_tumor
+
+def create_interactive_3d_model():
+    tumor_cells = generate_initial_tumor_3d()
+    init_diff_rate = 2e-5
+    init_consumption = 0.3
+    init_division = 0.7
+    init_death = 0.05
+    init_hypoxia = 5.0
+    fig = plt.figure(figsize=(14, 10))
+    ax_3d = fig.add_subplot(221, projection='3d')
+    ax_xy = fig.add_subplot(222)
+    ax_xz = fig.add_subplot(223)
+    ax_yz = fig.add_subplot(224)
+    fig.subplots_adjust(left=0.1, bottom=0.35, right=0.9, top=0.95)
+    ax_diff = fig.add_axes([0.15, 0.25, 0.65, 0.03])
+    diff_slider = Slider(ax=ax_diff, label='Diffusion Rate', valmin=0.5e-5, valmax=5e-5, valinit=init_diff_rate)
+    ax_cons = fig.add_axes([0.15, 0.20, 0.65, 0.03])
+    cons_slider = Slider(ax=ax_cons, label='Consumption Rate', valmin=0.1, valmax=0.8, valinit=init_consumption)
+    ax_div = fig.add_axes([0.15, 0.15, 0.65, 0.03])
+    div_slider = Slider(ax=ax_div, label='Division Probability', valmin=0.3, valmax=0.9, valinit=init_division)
+    ax_death = fig.add_axes([0.15, 0.10, 0.65, 0.03])
+    death_slider = Slider(ax=ax_death, label='Death Probability', valmin=0.01, valmax=0.2, valinit=init_death)
+    ax_hypoxia = fig.add_axes([0.15, 0.05, 0.65, 0.03])
+    hypoxia_slider = Slider(ax=ax_hypoxia, label='Hypoxia Threshold', valmin=1, valmax=10, valinit=init_hypoxia)
+    ax_button = fig.add_axes([0.8, 0.05, 0.1, 0.05])
+    run_button = Button(ax_button, 'Run Simulation')
+    def update_plot(tumor, oxygen):
+        ax_3d.clear()
+        ax_xy.clear()
+        ax_xz.clear()
+        ax_yz.clear()
+        x, y, z = np.where(tumor)
+        ax_3d.scatter(x, y, z, c='red', alpha=0.3, marker='o')
+        ax_3d.set_xlim(0, MATRIX_SIZE_X)
+        ax_3d.set_ylim(0, MATRIX_SIZE_Y)
+        ax_3d.set_zlim(0, MATRIX_SIZE_Z)
+        ax_3d.set_title('3D Tumor')
+        mid_z = MATRIX_SIZE_Z // 2
+        mid_y = MATRIX_SIZE_Y // 2
+        mid_x = MATRIX_SIZE_X // 2
+        ax_xy.imshow(oxygen[:,:,mid_z].T, cmap='jet', vmin=0, vmax=40)
+        ax_xy.set_title(f'Oxygen Distribution (Z={mid_z})')
+        ax_xz.imshow(tumor[:,mid_y,:].T, cmap='Reds')
+        ax_xz.set_title(f'Tumor Cells (Y={mid_y})')
+        surviving = np.logical_and(tumor, oxygen >= hypoxia_slider.val)
+        ax_yz.imshow(surviving[mid_x,:,:].T, cmap='Greens')
+        ax_yz.set_title(f'Viable Cells (X={mid_x})')
+        fig.canvas.draw_idle()
+    def run_simulation(event):
+        nonlocal tumor_cells
+        diff_rate = diff_slider.val
+        consumption = cons_slider.val
+        division = div_slider.val
+        death = death_slider.val
+        hypoxia = hypoxia_slider.val
+        for _ in range(10):
+            oxygen_grid = simulate_oxygen_3d(tumor_cells, diff_rate, consumption)
+            tumor_cells = simulate_growth_3d(tumor_cells, oxygen_grid, division, death, hypoxia)
+        update_plot(tumor_cells, oxygen_grid)
+    run_button.on_clicked(run_simulation)
+    oxygen_grid = simulate_oxygen_3d(tumor_cells)
+    update_plot(tumor_cells, oxygen_grid)
+    plt.show()
+
+def create_time_series_model():
+    tumor_history = []
+    oxygen_history = []
+    tumor_cells = generate_initial_tumor_3d()
+    diff_rate = 2e-5
+    consumption = 0.3
+    division = 0.7
+    death = 0.05
+    hypoxia = 5.0
+    print("Precomputing growth simulation...")
+    for step in range(50):
+        oxygen_grid = simulate_oxygen_3d(tumor_cells, diff_rate, consumption)
+        tumor_history.append(tumor_cells.copy())
+        oxygen_history.append(oxygen_grid.copy())
+        tumor_cells = simulate_growth_3d(tumor_cells, oxygen_grid, division, death, hypoxia)
+        if step % 10 == 0:
+            print(f"Timestep {step}: {np.sum(tumor_cells)} tumor cells")
+    fig = plt.figure(figsize=(14, 10))
+    ax_3d = fig.add_subplot(221, projection='3d')
+    ax_xy = fig.add_subplot(222)
+    ax_xz = fig.add_subplot(223)
+    ax_yz = fig.add_subplot(224)
+    fig.subplots_adjust(left=0.1, bottom=0.25, right=0.9, top=0.95)
+    ax_time = fig.add_axes([0.15, 0.10, 0.65, 0.03])
+    time_slider = Slider(ax=ax_time, label='Time Step', valmin=0, valmax=49, valinit=0, valstep=1)
+    def update_time(val):
+        time_idx = int(time_slider.val)
+        tumor = tumor_history[time_idx]
+        oxygen = oxygen_history[time_idx]
+        ax_3d.clear()
+        ax_xy.clear()
+        ax_xz.clear()
+        ax_yz.clear()
+        x, y, z = np.where(tumor)
+        ax_3d.scatter(x, y, z, c='red', alpha=0.3, marker='o')
+        ax_3d.set_xlim(0, MATRIX_SIZE_X)
+        ax_3d.set_ylim(0, MATRIX_SIZE_Y)
+        ax_3d.set_zlim(0, MATRIX_SIZE_Z)
+        ax_3d.set_title(f'3D Tumor (Step {time_idx})')
+        mid_z = MATRIX_SIZE_Z // 2
+        mid_y = MATRIX_SIZE_Y // 2
+        mid_x = MATRIX_SIZE_X // 2
+        ax_xy.imshow(oxygen[:,:,mid_z].T, cmap='jet', vmin=0, vmax=40)
+        ax_xy.set_title(f'Oxygen Distribution (Z={mid_z})')
+        ax_xz.imshow(tumor[:,mid_y,:].T, cmap='Reds')
+        ax_xz.set_title(f'Tumor Cells (Y={mid_y})')
+        surviving = np.logical_and(tumor, oxygen >= hypoxia)
+        ax_yz.imshow(surviving[mid_x,:,:].T, cmap='Greens')
+        ax_yz.set_title(f'Viable Cells (X={mid_x})')
+        plt.suptitle(f'Tumor Growth: {np.sum(tumor)} cells, Time step: {time_idx}')
+        fig.canvas.draw_idle()
+    time_slider.on_changed(update_time)
+    update_time(0)
+    plt.show()
+
+def main():
+    print("Starting 3D Tumor Growth Simulation with Oxygen Dynamics")
+    print("Choose visualization method:")
+    print("1. Interactive Parameter Adjustment")
+    print("2. Time Series Visualization")
+    choice = input("Enter choice (1-2): ")
+    if choice == '1':
+        create_interactive_3d_model()
+    elif choice == '2':
+        create_time_series_model()
+    else:
+        print("Invalid choice. Exiting.")
+
+if __name__ == "__main__":
+    main()
